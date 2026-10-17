@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from checkin import bilibili, netease, pica, uma, v2ex, yamibo, yurifans
 from telegram import Bot
+from curl_cffi.requests.exceptions import RequestException
 
 # info
 TG_USER_ID = os.environ.get("TG_USER_ID")
@@ -29,6 +30,29 @@ def run_module(main, attempts=3, delay=10):
     return f"模块异常（重试 {attempts} 次后仍失败）：{last_error}"
 
 
+def run_yamibo(main, attempts=3, delay=10):
+    """Return (safe message, success), retrying only before sign submission."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return main(), True
+        except yamibo.YamiboError as error:
+            failure = f"Yamibo 失败：{error}"
+            retryable = error.retryable
+        except RequestException:
+            failure = "Yamibo 网络请求失败"
+            retryable = True
+        except Exception:
+            failure = "Yamibo 发生未预期异常，停止自动重试"
+            retryable = False
+
+        if yamibo.sign_submission_started:
+            retryable = False
+        if not retryable or attempt == attempts:
+            return failure, False
+        time.sleep(delay)
+    return "Yamibo 未执行：重试次数必须大于零", False
+
+
 def send_message(content, attempts=3, delay=15):
     bot = Bot(token=TG_BOT_TOKEN)
     for attempt in range(1, attempts + 1):
@@ -43,17 +67,19 @@ def send_message(content, attempts=3, delay=15):
     return False
 
 
-if __name__ == "__main__":
+def main():
     start_time = time.time()
     utc_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
     content_lst = []
+    yamibo_success = True
 
     if os.environ.get("UMA_COOKIES"):
         content_lst.append(f"「賽馬娘每日簽到」\n{run_module(uma.main)}")
     if os.environ.get("YAMIBO_USERNAME") and os.environ.get("YAMIBO_PASSWORD"):
-        content_lst.append(f"「Yamibo」\n{run_module(yamibo.main)}")
+        yamibo_content, yamibo_success = run_yamibo(yamibo.main)
+        content_lst.append(f"「Yamibo」\n{yamibo_content}")
     if os.environ.get("YURIFANS_EMAIL") and os.environ.get("YURIFANS_PASSWORD"):
         content_lst.append(f"「Yurifans」\n{run_module(yurifans.main)}")
     if os.environ.get("V2EX_COOKIES"):
@@ -72,6 +98,9 @@ if __name__ == "__main__":
 
     print(content)
 
-    if TG_BOT_TOKEN:
-        if not send_message(content):
-            sys.exit(1)
+    notification_failed = bool(TG_BOT_TOKEN and not send_message(content))
+    return int(not yamibo_success or notification_failed)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

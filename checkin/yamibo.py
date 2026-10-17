@@ -5,8 +5,11 @@
 
 import os
 import re
+import sys
+from urllib.parse import parse_qsl, urlsplit
 
 from curl_cffi import requests as cffi_requests
+from curl_cffi.requests.exceptions import RequestException
 from lxml import html
 from playwright.sync_api import sync_playwright
 
@@ -16,6 +19,16 @@ from checkin import net
 USERNAME = os.environ.get("YAMIBO_USERNAME")
 PASSWORD = os.environ.get("YAMIBO_PASSWORD")
 msg = []
+sign_submission_started = False
+
+
+class YamiboError(Exception):
+    """A safe, user-facing Yamibo failure; never pass response or exception text."""
+
+    def __init__(self, message, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
+
 
 BASE_URL = "https://bbs.yamibo.com"
 
@@ -29,6 +42,39 @@ HEADERS = {
 }
 
 
+def _raise_cloudflare_challenge(response, stage):
+    """Recognize a challenge, not merely a Cloudflare-served normal page."""
+    headers = {str(name).lower(): str(value).strip().lower()
+               for name, value in response.headers.items()}
+    challenge_header = headers.get("cf-mitigated") == "challenge"
+    challenge_script = bool(re.search(r"cf-chl-|/cdn-cgi/challenge-platform", response.text, re.I))
+    challenge_title = bool(re.search(
+        r"<title>\s*(?:Just a moment(?:\.{3})?|Attention Required!\s*\|\s*Cloudflare)\s*</title>",
+        response.text, re.I,
+    ))
+    if challenge_header or (challenge_script and challenge_title):
+        raise YamiboError(f"{stage}遭遇 Cloudflare 安全验证，无法确认签到状态")
+
+
+def _validate_response(response, stage, allow_login_page=False):
+    """Reject transport/authentication error pages before the existing parser."""
+    _raise_cloudflare_challenge(response, stage)
+    if not 200 <= response.status_code < 300:
+        raise YamiboError(f"{stage}返回 HTTP {response.status_code}，无法确认签到状态")
+    if allow_login_page:
+        return
+    parts = urlsplit(str(getattr(response, "url", "")))
+    query = dict(parse_qsl(parts.query))
+    login_url = parts.path.endswith("/member.php") and query.get("action") == "login"
+    login_form = bool(re.search(
+        r"<form\b[^>]*(?:name\s*=\s*[\"']login[\"']|id\s*=\s*[\"']loginform(?:_[^\"']*)?[\"'])",
+        response.text, re.I,
+    ))
+    login_prompt = "需要先登录" in response.text or "请先登录" in response.text
+    if login_url or login_form or login_prompt:
+        raise YamiboError("登录状态失效，网站返回登录页面或登录提示")
+
+
 def solve_waf():
     """Ensure the forum is reachable: fast path on 200, else solve the challenge in a real browser."""
     r = SESSION.get(
@@ -37,6 +83,7 @@ def solve_waf():
         impersonate="chrome",
         timeout=15,
     )
+    _raise_cloudflare_challenge(r, "论坛页面")
     if r.status_code == 200:
         return True
 
@@ -63,7 +110,7 @@ def login():
 
     if not net.open_route(SESSION, f"{BASE_URL}/forum.php", impersonate="chrome"):
         msg.append({"name": "登录信息", "value": "无法连接网站"})
-        return False
+        raise YamiboError("无法连接网站", retryable=True)
 
     if not solve_waf():
         msg.append({"name": "登录信息", "value": "WAF 挑战失败"})
@@ -83,6 +130,8 @@ def login():
         },
         impersonate="chrome",
     )
+
+    _validate_response(r, "登录页面", allow_login_page=True)
 
     formhash_match = re.search(r'name="formhash"\s+value="([a-f0-9]+)"', r.text)
     loginhash_match = re.search(r'loginhash=([a-zA-Z0-9]+)', r.text)
@@ -121,16 +170,16 @@ def login():
         impersonate="chrome",
     )
 
+    _validate_response(r2, "登录响应", allow_login_page=True)
+
     if "succeedhandle" in r2.text or "succeed" in r2.text:
         msg.append({"name": "登录信息", "value": "登录成功"})
         return True
     elif "登录失败" in r2.text:
-        error_match = re.search(r'<p[^>]*>([^<]+)</p>', r2.text)
-        error_msg = error_match.group(1) if error_match else "登录失败"
-        msg.append({"name": "登录信息", "value": error_msg})
+        msg.append({"name": "登录信息", "value": "登录失败，请检查认证信息"})
         return False
     else:
-        msg.append({"name": "登录信息", "value": f"登录失败，{r2.text[:100]}"})
+        msg.append({"name": "登录信息", "value": "登录失败，网站未返回明确成功结果"})
         return False
 
 
@@ -141,6 +190,8 @@ def get_sign_page():
     """
     url = f"{BASE_URL}/plugin.php?id=zqlj_sign"
     r = SESSION.get(url, headers=HEADERS, impersonate="chrome")
+
+    _validate_response(r, "签到页面")
 
     global msg
     if "需要先登录" in r.text:
@@ -163,8 +214,12 @@ def get_sign_page():
 
 def check_in(sign_hash):
     """Perform sign-in by visiting the sign URL with the one-time hash."""
+    global sign_submission_started
+    sign_submission_started = True
     url = f"{BASE_URL}/plugin.php?id=zqlj_sign&sign={sign_hash}"
     r = SESSION.get(url, headers=HEADERS, impersonate="chrome")
+
+    _validate_response(r, "签到请求")
 
     global msg
     if "打卡成功" in r.text:
@@ -199,6 +254,7 @@ def query_stats(page_text):
 
     url = f"{BASE_URL}/home.php?mod=spacecp&ac=credit"
     r = SESSION.get(url, headers=HEADERS, impersonate="chrome")
+    _validate_response(r, "账户信息")
     tree = html.fromstring(r.content)
     items = tree.xpath('//ul[@class="creditl mtm bbda cl"]/li')
 
@@ -219,30 +275,62 @@ def query_stats(page_text):
 
 
 def main():
-    global msg
+    global msg, sign_submission_started
+    msg = []
+    sign_submission_started = False
     if not USERNAME or not PASSWORD:
-        return "No YAMIBO_USERNAME or YAMIBO_PASSWORD set"
+        raise YamiboError("未配置 Yamibo 登录信息")
 
-    if not login():
-        return "\n".join([f"{one.get('name')}: {one.get('value')}" for one in msg])
+    try:
+        if not login():
+            raise YamiboError("登录失败，未能确认认证成功")
 
-    sign_hash, already_signed, page_text = get_sign_page()
-    if sign_hash is None and already_signed is None:
-        return "\n".join([f"{one.get('name')}: {one.get('value')}" for one in msg])
+        sign_hash, already_signed, page_text = get_sign_page()
+        if already_signed is None:
+            raise YamiboError("无法获取签到状态")
+        if not already_signed:
+            if not sign_hash:
+                raise YamiboError("未获取签到 hash，不能确认已签到")
+            # Once submitted, transport failures may hide a completed sign-in.
+            # The runner must never replay the entire operation after this point.
+            sign_submission_started = True
+            succeeded, _ = check_in(sign_hash)
+            if not succeeded:
+                raise YamiboError("签到失败或结果不明确，停止自动重试")
+        else:
+            msg.append({"name": "签到信息", "value": "今日已签到，无需重复签到"})
+    except RequestException:
+        if sign_submission_started:
+            raise YamiboError("签到请求结果不明确，停止自动重试") from None
+        raise YamiboError("签到前网络请求失败", retryable=True) from None
 
-    if not already_signed and sign_hash:
-        check_in(sign_hash)
-        r2 = SESSION.get(f"{BASE_URL}/plugin.php?id=zqlj_sign", headers=HEADERS, impersonate="chrome")
-        page_text = r2.text
-    else:
-        msg.append({"name": "签到信息", "value": "今日已签到，无需重复签到"})
-
-    query_stats(page_text)
+    # Sign-in is confirmed. Supplementary queries cannot turn it into a retry.
+    try:
+        if sign_submission_started:
+            r2 = SESSION.get(
+                f"{BASE_URL}/plugin.php?id=zqlj_sign",
+                headers=HEADERS,
+                impersonate="chrome",
+            )
+            _validate_response(r2, "签到状态刷新")
+            page_text = r2.text
+        query_stats(page_text)
+    except Exception:
+        msg.append({"name": "统计信息", "value": "签到已确认，附加信息查询失败"})
 
     return "\n".join([f"{one.get('name')}: {one.get('value')}" for one in msg])
 
 
 if __name__ == "__main__":
     print(" Yamibo 签到开始 ".center(60, "="))
-    print(main())
+    exit_code = 0
+    try:
+        print(main())
+    except YamiboError as error:
+        print(f"Yamibo 失败：{error}")
+        exit_code = 1
+    except Exception:
+        print("Yamibo 发生未预期异常，停止自动重试")
+        exit_code = 1
     print(" Yamibo 签到结束 ".center(60, "="), "\n")
+    sys.exit(exit_code)
