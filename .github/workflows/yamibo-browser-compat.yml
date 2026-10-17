@@ -1,0 +1,27 @@
+name: Anonymous browser compatibility research (no check-in)
+
+on:
+  push:
+    branches:
+      - codex/yamibo-browser-compat-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          python-version: '3.13'
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Install standard Chromium
+        run: uv run --frozen playwright install chromium --with-deps
+      - name: Install virtual display
+        run: sudo apt-get install -y xvfb
+      - name: Research anonymous browser responses; no account credentials
+        run: xvfb-run -a uv run --frozen python tools/yamibo_browser_compat.py
